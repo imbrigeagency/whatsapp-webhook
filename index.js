@@ -106,9 +106,11 @@ async function scoreLead(lead) {
 
 async function handleMessage(from, messageText) {
   const text = messageText.trim().toLowerCase();
+  console.log(`Message from ${from}: "${text}"`);
 
   let result = await pool.query('SELECT * FROM leads WHERE phone = $1', [from]);
   let lead = result.rows[0];
+  console.log(`Lead found:`, lead ? lead.current_step : 'NEW USER');
 
   if (!lead) {
     await pool.query('INSERT INTO leads (phone) VALUES ($1)', [from]);
