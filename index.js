@@ -17,6 +17,10 @@ const PHONE_NUMBER_ID = '1097591180108358';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 
+console.log('GEMINI_API_KEY set:', !!GEMINI_API_KEY);
+console.log('DATABASE_URL set:', !!DATABASE_URL);
+console.log('WHATSAPP_TOKEN set:', !!WHATSAPP_TOKEN);
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -79,6 +83,7 @@ async function initDB() {
     END
     $$;
   `);
+  console.log('DB initialized successfully');
 }
 
 async function sendMessage(to, message) {
@@ -132,7 +137,7 @@ Your job is to help buyers find properties while naturally collecting these 5 da
 
 Rules:
 - Respond in warm, conversational WhatsApp style. Short messages only.
-- Collect missing data points naturally — don't make it feel like a form.
+- Collect missing data points naturally do not make it feel like a form.
 - If the user gives multiple data points in one message, capture all of them.
 - Accept free text answers. Don't force numbered options unless helpful.
 - Never repeat a question you already have the answer to.
@@ -150,14 +155,8 @@ Lead scoring rules:
 Until you have all 5 data points, just respond naturally. Do not output JSON until all 5 are collected.`;
 
   const contents = [
-    {
-      role: 'user',
-      parts: [{ text: SYSTEM_PROMPT }]
-    },
-    {
-      role: 'model',
-      parts: [{ text: 'Understood. I will act as the Imbrige Agency WhatsApp assistant and naturally collect all 5 data points before scoring.' }]
-    },
+    { role: 'user', parts: [{ text: SYSTEM_PROMPT }] },
+    { role: 'model', parts: [{ text: 'Understood. I will act as the Imbrige Agency WhatsApp assistant.' }] },
     ...conversationHistory.map(msg => ({
       role: msg.role === 'user' ? 'user' : 'model',
       parts: [{ text: msg.text }]
@@ -182,16 +181,32 @@ Until you have all 5 data points, just respond naturally. Do not output JSON unt
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
+          console.log('Gemini raw response (first 500 chars):', data.substring(0, 500));
           const parsed = JSON.parse(data);
+          if (parsed.error) {
+            console.error('Gemini API error:', JSON.stringify(parsed.error));
+            resolve(null);
+            return;
+          }
           const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          if (!text) {
+            console.error('Gemini returned empty text. Full response:', data);
+            resolve(null);
+            return;
+          }
+          console.log('Gemini response text:', text.substring(0, 200));
           resolve(text.trim());
         } catch (e) {
-          console.error('Gemini parse error:', e, data);
+          console.error('Gemini parse error:', e.message);
+          console.error('Gemini raw data:', data.substring(0, 500));
           resolve(null);
         }
       });
     });
-    req.on('error', reject);
+    req.on('error', (e) => {
+      console.error('Gemini request error:', e.message);
+      reject(e);
+    });
     req.write(body);
     req.end();
   });
@@ -224,103 +239,66 @@ function extractJSON(text) {
 
 async function handleMessage(from, messageText) {
   const text = messageText.trim();
-  console.log(`Message from ${from}: "${text}"`);
+  console.log('Message from ' + from + ': "' + text + '"');
 
   let result = await pool.query('SELECT * FROM leads WHERE phone = $1', [from]);
   let lead = result.rows[0];
 
   if (!lead) {
-    await pool.query(
-      'INSERT INTO leads (phone, conversation_history) VALUES ($1, $2)',
-      [from, JSON.stringify([])]
-    );
+    await pool.query('INSERT INTO leads (phone, conversation_history) VALUES ($1, $2)', [from, JSON.stringify([])]);
     result = await pool.query('SELECT * FROM leads WHERE phone = $1', [from]);
     lead = result.rows[0];
     console.log('New lead created for:', from);
   }
 
   if (lead.completed) {
-    await sendMessage(from, `Our team already has your details and will be in touch shortly. Thank you! 🙏`);
+    await sendMessage(from, 'Our team already has your details and will be in touch shortly. Thank you!');
     return;
   }
 
   const history = Array.isArray(lead.conversation_history) ? lead.conversation_history : [];
   history.push({ role: 'user', text });
 
-  console.log('Calling Gemini...');
+  console.log('Calling Gemini with ' + history.length + ' messages...');
   const geminiResponse = await callGemini(history);
 
   if (!geminiResponse) {
-    await sendMessage(from, `Sorry, I'm having a technical issue. Please try again in a moment.`);
+    console.error('Gemini returned null — sending error message');
+    await sendMessage(from, 'Sorry, I am having a technical issue. Please try again in a moment.');
     return;
   }
-
-  console.log('Gemini response:', geminiResponse);
 
   const extracted = extractJSON(geminiResponse);
 
   if (extracted) {
     history.push({ role: 'model', text: geminiResponse });
-
     await pool.query(`
       UPDATE leads SET
-        conversation_history = $1,
-        budget = $2,
-        location = $3,
-        property_type = $4,
-        timeline = $5,
-        intent = $6,
-        lead_score = $7,
-        sales_summary = $8,
-        completed = TRUE,
-        updated_at = NOW()
+        conversation_history = $1, budget = $2, location = $3,
+        property_type = $4, timeline = $5, intent = $6,
+        lead_score = $7, sales_summary = $8, completed = TRUE, updated_at = NOW()
       WHERE phone = $9
-    `, [
-      JSON.stringify(history),
-      extracted.budget,
-      extracted.location,
-      extracted.property_type,
-      extracted.timeline,
-      extracted.intent,
-      extracted.lead_score,
-      extracted.sales_summary,
-      from
-    ]);
+    `, [JSON.stringify(history), extracted.budget, extracted.location, extracted.property_type, extracted.timeline, extracted.intent, extracted.lead_score, extracted.sales_summary, from]);
 
-    const completionMessage = `Thank you! ✅\n\nYour preferences have been shared with our team at Imbrige Agency. A property advisor will contact you shortly with matching options.\n\n_Score: ${extracted.lead_score}_`;
-    await sendMessage(from, completionMessage);
-    console.log(`Lead completed for ${from} — Score: ${extracted.lead_score}`);
+    await sendMessage(from, 'Thank you! Your preferences have been shared with our team at Imbrige Agency. A property advisor will contact you shortly. Score: ' + extracted.lead_score);
+    console.log('Lead completed for ' + from + ' Score: ' + extracted.lead_score);
 
   } else {
     history.push({ role: 'model', text: geminiResponse });
-
-    await pool.query(`
-      UPDATE leads SET
-        conversation_history = $1,
-        updated_at = NOW()
-      WHERE phone = $2
-    `, [JSON.stringify(history), from]);
-
+    await pool.query('UPDATE leads SET conversation_history = $1, updated_at = NOW() WHERE phone = $2', [JSON.stringify(history), from]);
     await sendMessage(from, geminiResponse);
   }
 }
 
-app.get('/', (req, res) => {
-  res.send('Imbrige WhatsApp Bot is running');
-});
+app.get('/', (req, res) => res.send('Imbrige WhatsApp Bot is running'));
 
 app.get('/last-reply', async (req, res) => {
   const phone = req.query.phone;
   if (!phone) return res.status(400).json({ error: 'phone required' });
-
   try {
-    const result = await pool.query(
-      'SELECT last_reply, last_reply_at FROM leads WHERE phone = $1',
-      [phone]
-    );
+    const result = await pool.query('SELECT last_reply, last_reply_at FROM leads WHERE phone = $1', [phone]);
     if (result.rows.length === 0) return res.json({ reply: null, timestamp: null });
-    const row = result.rows[0];
-    res.json({ reply: row.last_reply, timestamp: row.last_reply_at });
+    res.json({ reply: result.rows[0].last_reply, timestamp: result.rows[0].last_reply_at });
   } catch (e) {
     console.error('last-reply error:', e);
     res.status(500).json({ error: 'db error' });
@@ -349,9 +327,7 @@ app.post('/webhook', async (req, res) => {
       const message = messages[0];
       const from = message.from;
       const text = message.text?.body;
-      if (from && text) {
-        await handleMessage(from, text);
-      }
+      if (from && text) await handleMessage(from, text);
     }
   } catch (e) {
     console.error('Webhook error:', e);
@@ -360,6 +336,6 @@ app.post('/webhook', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log('Server running on port ' + PORT);
   initDB().catch(err => console.error('DB init error:', err));
 });
