@@ -5,6 +5,12 @@ const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
+
 const VERIFY_TOKEN = 'imbrige2024';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = '1097591180108358';
@@ -17,7 +23,6 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  // Create leads table with conversation_history as JSONB
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leads (
       id SERIAL PRIMARY KEY,
@@ -31,12 +36,13 @@ async function initDB() {
       lead_score TEXT,
       sales_summary TEXT,
       completed BOOLEAN DEFAULT FALSE,
+      last_reply TEXT,
+      last_reply_at BIGINT,
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     )
   `);
 
-  // Migrate existing table if it has old schema (current_step column)
   await pool.query(`
     DO $$
     BEGIN
@@ -58,12 +64,29 @@ async function initDB() {
       ) THEN
         ALTER TABLE leads ADD COLUMN completed BOOLEAN DEFAULT FALSE;
       END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='leads' AND column_name='last_reply'
+      ) THEN
+        ALTER TABLE leads ADD COLUMN last_reply TEXT;
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='leads' AND column_name='last_reply_at'
+      ) THEN
+        ALTER TABLE leads ADD COLUMN last_reply_at BIGINT;
+      END IF;
     END
     $$;
   `);
 }
 
 async function sendMessage(to, message) {
+  await pool.query(
+    'UPDATE leads SET last_reply = $1, last_reply_at = $2 WHERE phone = $3',
+    [message, Date.now(), to]
+  );
+
   const body = JSON.stringify({
     messaging_product: 'whatsapp',
     to: to,
@@ -86,7 +109,10 @@ async function sendMessage(to, message) {
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data));
+      res.on('end', () => {
+        console.log('WhatsApp API response:', data);
+        resolve(data);
+      });
     });
     req.on('error', reject);
     req.write(body);
@@ -111,6 +137,7 @@ Rules:
 - Accept free text answers. Don't force numbered options unless helpful.
 - Never repeat a question you already have the answer to.
 - Keep responses under 100 words.
+- Use emojis occasionally to feel natural.
 
 Once you have collected ALL 5 data points, score the lead and respond with ONLY this JSON (no extra text before or after):
 {"collected":true,"budget":"...","location":"...","property_type":"...","timeline":"...","intent":"...","lead_score":"Hot/Warm/Cold","sales_summary":"one sentence about this buyer"}
@@ -122,10 +149,7 @@ Lead scoring rules:
 
 Until you have all 5 data points, just respond naturally. Do not output JSON until all 5 are collected.`;
 
-  // Build Gemini contents array from conversation history
-  // Gemini expects alternating user/model turns
   const contents = [
-    // Inject system prompt as first user message + model acknowledgement
     {
       role: 'user',
       parts: [{ text: SYSTEM_PROMPT }]
@@ -134,7 +158,6 @@ Until you have all 5 data points, just respond naturally. Do not output JSON unt
       role: 'model',
       parts: [{ text: 'Understood. I will act as the Imbrige Agency WhatsApp assistant and naturally collect all 5 data points before scoring.' }]
     },
-    // Then the actual conversation
     ...conversationHistory.map(msg => ({
       role: msg.role === 'user' ? 'user' : 'model',
       parts: [{ text: msg.text }]
@@ -175,14 +198,11 @@ Until you have all 5 data points, just respond naturally. Do not output JSON unt
 }
 
 function extractJSON(text) {
-  // Try to find a JSON block in Gemini's response
   try {
-    // Direct parse — Gemini returned clean JSON
     const parsed = JSON.parse(text);
     if (parsed.collected === true) return parsed;
   } catch (_) {}
 
-  // Try extracting JSON from markdown code block
   const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (codeBlockMatch) {
     try {
@@ -191,7 +211,6 @@ function extractJSON(text) {
     } catch (_) {}
   }
 
-  // Try finding raw JSON object anywhere in the text
   const jsonMatch = text.match(/\{[\s\S]*"collected"\s*:\s*true[\s\S]*\}/);
   if (jsonMatch) {
     try {
@@ -207,28 +226,28 @@ async function handleMessage(from, messageText) {
   const text = messageText.trim();
   console.log(`Message from ${from}: "${text}"`);
 
-  // Get or create lead record
   let result = await pool.query('SELECT * FROM leads WHERE phone = $1', [from]);
   let lead = result.rows[0];
 
   if (!lead) {
-    await pool.query('INSERT INTO leads (phone, conversation_history) VALUES ($1, $2)', [from, JSON.stringify([])]);
+    await pool.query(
+      'INSERT INTO leads (phone, conversation_history) VALUES ($1, $2)',
+      [from, JSON.stringify([])]
+    );
     result = await pool.query('SELECT * FROM leads WHERE phone = $1', [from]);
     lead = result.rows[0];
     console.log('New lead created for:', from);
   }
 
-  // If already completed, send a polite message and stop
   if (lead.completed) {
     await sendMessage(from, `Our team already has your details and will be in touch shortly. Thank you! 🙏`);
     return;
   }
 
-  // Load existing history and append new user message
   const history = Array.isArray(lead.conversation_history) ? lead.conversation_history : [];
   history.push({ role: 'user', text });
 
-  // Call Gemini with full history
+  console.log('Calling Gemini...');
   const geminiResponse = await callGemini(history);
 
   if (!geminiResponse) {
@@ -238,11 +257,9 @@ async function handleMessage(from, messageText) {
 
   console.log('Gemini response:', geminiResponse);
 
-  // Check if Gemini has collected all data points
   const extracted = extractJSON(geminiResponse);
 
   if (extracted) {
-    // All 5 data points collected — save lead and complete
     history.push({ role: 'model', text: geminiResponse });
 
     await pool.query(`
@@ -275,7 +292,6 @@ async function handleMessage(from, messageText) {
     console.log(`Lead completed for ${from} — Score: ${extracted.lead_score}`);
 
   } else {
-    // Conversation still ongoing — save history and send Gemini's natural reply
     history.push({ role: 'model', text: geminiResponse });
 
     await pool.query(`
@@ -291,6 +307,24 @@ async function handleMessage(from, messageText) {
 
 app.get('/', (req, res) => {
   res.send('Imbrige WhatsApp Bot is running');
+});
+
+app.get('/last-reply', async (req, res) => {
+  const phone = req.query.phone;
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+
+  try {
+    const result = await pool.query(
+      'SELECT last_reply, last_reply_at FROM leads WHERE phone = $1',
+      [phone]
+    );
+    if (result.rows.length === 0) return res.json({ reply: null, timestamp: null });
+    const row = result.rows[0];
+    res.json({ reply: row.last_reply, timestamp: row.last_reply_at });
+  } catch (e) {
+    console.error('last-reply error:', e);
+    res.status(500).json({ error: 'db error' });
+  }
 });
 
 app.get('/webhook', (req, res) => {
