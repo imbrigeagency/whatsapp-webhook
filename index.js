@@ -14,10 +14,10 @@ app.use((req, res, next) => {
 const VERIFY_TOKEN = 'imbrige2024';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = '1097591180108358';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-console.log('GEMINI_API_KEY set:', !!GEMINI_API_KEY);
+console.log('GROQ_API_KEY set:', !!GROQ_API_KEY);
 console.log('DATABASE_URL set:', !!DATABASE_URL);
 console.log('WHATSAPP_TOKEN set:', !!WHATSAPP_TOKEN);
 
@@ -125,7 +125,7 @@ async function sendMessage(to, message) {
   });
 }
 
-async function callGemini(conversationHistory) {
+async function callGroq(conversationHistory) {
   const SYSTEM_PROMPT = `You are a friendly WhatsApp assistant for Imbrige Agency, an Indian real estate agency in Ahmedabad.
 
 Your job is to help buyers find properties while naturally collecting these 5 data points through conversation:
@@ -137,9 +137,9 @@ Your job is to help buyers find properties while naturally collecting these 5 da
 
 Rules:
 - Respond in warm, conversational WhatsApp style. Short messages only.
-- Collect missing data points naturally do not make it feel like a form.
+- Collect missing data points naturally, do not make it feel like a form.
 - If the user gives multiple data points in one message, capture all of them.
-- Accept free text answers. Don't force numbered options unless helpful.
+- Accept free text answers. Do not force numbered options unless helpful.
 - Never repeat a question you already have the answer to.
 - Keep responses under 100 words.
 - Use emojis occasionally to feel natural.
@@ -154,22 +154,27 @@ Lead scoring rules:
 
 Until you have all 5 data points, just respond naturally. Do not output JSON until all 5 are collected.`;
 
-  const contents = [
-    { role: 'user', parts: [{ text: SYSTEM_PROMPT }] },
-    { role: 'model', parts: [{ text: 'Understood. I will act as the Imbrige Agency WhatsApp assistant.' }] },
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
     ...conversationHistory.map(msg => ({
-      role: msg.role === 'user' ? 'user' : 'model',
-      parts: [{ text: msg.text }]
+      role: msg.role === 'user' ? 'user' : 'assistant',
+      content: msg.text
     }))
   ];
 
-  const body = JSON.stringify({ contents });
+  const body = JSON.stringify({
+    model: 'llama-3.3-70b-versatile',
+    messages: messages,
+    temperature: 0.7,
+    max_tokens: 500
+  });
 
   const options = {
-    hostname: 'generativelanguage.googleapis.com',
-    path: `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+    hostname: 'api.groq.com',
+    path: '/openai/v1/chat/completions',
     method: 'POST',
     headers: {
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(body)
     }
@@ -181,30 +186,30 @@ Until you have all 5 data points, just respond naturally. Do not output JSON unt
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
-          console.log('Gemini raw response (first 500 chars):', data.substring(0, 500));
+          console.log('Groq raw response (first 500):', data.substring(0, 500));
           const parsed = JSON.parse(data);
           if (parsed.error) {
-            console.error('Gemini API error:', JSON.stringify(parsed.error));
+            console.error('Groq API error:', JSON.stringify(parsed.error));
             resolve(null);
             return;
           }
-          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          const text = parsed.choices?.[0]?.message?.content || '';
           if (!text) {
-            console.error('Gemini returned empty text. Full response:', data);
+            console.error('Groq returned empty text. Full response:', data);
             resolve(null);
             return;
           }
-          console.log('Gemini response text:', text.substring(0, 200));
+          console.log('Groq response text:', text.substring(0, 200));
           resolve(text.trim());
         } catch (e) {
-          console.error('Gemini parse error:', e.message);
-          console.error('Gemini raw data:', data.substring(0, 500));
+          console.error('Groq parse error:', e.message);
+          console.error('Groq raw data:', data.substring(0, 500));
           resolve(null);
         }
       });
     });
     req.on('error', (e) => {
-      console.error('Gemini request error:', e.message);
+      console.error('Groq request error:', e.message);
       reject(e);
     });
     req.write(body);
@@ -259,19 +264,19 @@ async function handleMessage(from, messageText) {
   const history = Array.isArray(lead.conversation_history) ? lead.conversation_history : [];
   history.push({ role: 'user', text });
 
-  console.log('Calling Gemini with ' + history.length + ' messages...');
-  const geminiResponse = await callGemini(history);
+  console.log('Calling Groq with ' + history.length + ' messages...');
+  const groqResponse = await callGroq(history);
 
-  if (!geminiResponse) {
-    console.error('Gemini returned null — sending error message');
+  if (!groqResponse) {
+    console.error('Groq returned null — sending error message');
     await sendMessage(from, 'Sorry, I am having a technical issue. Please try again in a moment.');
     return;
   }
 
-  const extracted = extractJSON(geminiResponse);
+  const extracted = extractJSON(groqResponse);
 
   if (extracted) {
-    history.push({ role: 'model', text: geminiResponse });
+    history.push({ role: 'model', text: groqResponse });
     await pool.query(`
       UPDATE leads SET
         conversation_history = $1, budget = $2, location = $3,
@@ -282,11 +287,10 @@ async function handleMessage(from, messageText) {
 
     await sendMessage(from, 'Thank you! Your preferences have been shared with our team at Imbrige Agency. A property advisor will contact you shortly. Score: ' + extracted.lead_score);
     console.log('Lead completed for ' + from + ' Score: ' + extracted.lead_score);
-
   } else {
-    history.push({ role: 'model', text: geminiResponse });
+    history.push({ role: 'model', text: groqResponse });
     await pool.query('UPDATE leads SET conversation_history = $1, updated_at = NOW() WHERE phone = $2', [JSON.stringify(history), from]);
-    await sendMessage(from, geminiResponse);
+    await sendMessage(from, groqResponse);
   }
 }
 
