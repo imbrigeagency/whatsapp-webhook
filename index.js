@@ -188,9 +188,9 @@ const server = http.createServer((req, res) => {
   }
 });
 
-initDB().then(() => {
-  server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
-    console.log('Server running');
-  });
+server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
+  console.log('Server running on port', process.env.PORT || 3000);
+  initDB().catch(err => console.error('DB init error:', err));
 });
+
 
