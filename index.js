@@ -1,7 +1,9 @@
-const http = require('http');
+const express = require('express');
 const https = require('https');
-const url = require('url');
 const { Pool } = require('pg');
+
+const app = express();
+app.use(express.json());
 
 const VERIFY_TOKEN = 'imbrige2024';
 const WHATSAPP_TOKEN = 'EAANoV7FaoaIBRU9hikEGhTaDO5eSlH42nM83P6EMOeKuoBFZCkEZCuvaX0lxRSHrMl3AtXruFY9KvIreo6wPIBuradJnHdqd6g2yTVVmtKNp1HRut2OvlIfk7gnnK6yiqZAlnCu43vJpmg9WZCvd3drZAzcIcusLQvppBkKnDqbBHmczZARuvUFc8ZAjyfvAyZBM';
@@ -149,48 +151,43 @@ async function handleMessage(from, messageText) {
   }
 }
 
-const server = http.createServer((req, res) => {
-  const parsed = url.parse(req.url, true);
-  const query = parsed.query;
+app.get('/', (req, res) => {
+  res.send('Imbrige WhatsApp Bot is running');
+});
 
-  if (req.method === 'GET') {
-    if (query['hub.mode'] === 'subscribe' && query['hub.verify_token'] === VERIFY_TOKEN) {
-      res.writeHead(200);
-      res.end(query['hub.challenge']);
-    } else {
-      res.writeHead(403);
-      res.end('Forbidden');
-    }
-  } else if (req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      res.writeHead(200);
-      res.end('OK');
-      try {
-        const data = JSON.parse(body);
-        const entry = data.entry?.[0];
-        const changes = entry?.changes?.[0];
-        const value = changes?.value;
-        const messages = value?.messages;
-        if (messages && messages.length > 0) {
-          const message = messages[0];
-          const from = message.from;
-          const text = message.text?.body;
-          if (from && text) {
-            await handleMessage(from, text);
-          }
-        }
-      } catch (e) {
-        console.error('Error:', e);
-      }
-    });
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
   }
 });
 
-server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
-  console.log('Server running on port', process.env.PORT || 3000);
-  initDB().catch(err => console.error('DB init error:', err));
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const entry = req.body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+    const messages = value?.messages;
+    if (messages && messages.length > 0) {
+      const message = messages[0];
+      const from = message.from;
+      const text = message.text?.body;
+      if (from && text) {
+        await handleMessage(from, text);
+      }
+    }
+  } catch (e) {
+    console.error('Error:', e);
+  }
 });
 
-
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+  initDB().catch(err => console.error('DB init error:', err));
+});
